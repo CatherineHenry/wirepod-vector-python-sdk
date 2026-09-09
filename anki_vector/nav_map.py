@@ -37,6 +37,8 @@ from enum import Enum
 from logging import Logger
 from typing import List
 
+import numpy as np
+
 from . import util
 from .events import Events
 from .exceptions import VectorException
@@ -332,6 +334,30 @@ class NavMapGrid:
         """
         self._root_node.add_child(content, depth)
 
+    def quad_tree_safe_and_unsafe_coordinates(self, nav_memory_map_node, safe_coordinates: list, unsafe_coordinates: list):
+        if nav_memory_map_node.children is not None:
+            self.quad_tree_safe_and_unsafe_coordinates(nav_memory_map_node.children[3], safe_coordinates, unsafe_coordinates)
+            self.quad_tree_safe_and_unsafe_coordinates(nav_memory_map_node.children[0], safe_coordinates, unsafe_coordinates)
+            self.quad_tree_safe_and_unsafe_coordinates(nav_memory_map_node.children[1], safe_coordinates, unsafe_coordinates)
+            self.quad_tree_safe_and_unsafe_coordinates(nav_memory_map_node.children[2], safe_coordinates, unsafe_coordinates)
+
+        else:
+            content = "NA" if nav_memory_map_node.content is None else NavNodeContentTypes(nav_memory_map_node.content).name  # leaf node, so should have content!
+            if content in ["ClearOfCliff", "ClearOfObstacle"]:
+                center = (nav_memory_map_node.center.x, nav_memory_map_node.center.y)
+                size = nav_memory_map_node.size
+                min_bounds = np.array([center[0] - (size/2), center[1] - (size/2)])  # x, y
+                max_bounds = np.array( [center[0] + (size/2), center[1] + (size/2)])  # x,y
+                safe_coordinates.append(np.array([min_bounds, max_bounds]))
+
+            elif content in ["ObstacleCube"]:#, "ObstacleProximity", "ObstacleProximityExplored"]:#, "ObstacleCharger", "Cliff", "VisionBorder"]:
+                center = (nav_memory_map_node.center.x, nav_memory_map_node.center.y)
+                size = nav_memory_map_node.size
+                min_bounds = np.array([center[0] - (size/2), center[1] - (size/2)])  # x, y
+                max_bounds = np.array( [center[0] + (size/2), center[1] + (size/2)])  # x,y
+                unsafe_coordinates.append(np.array([min_bounds, max_bounds]))
+
+
 
 class NavMapComponent(util.Component):
     """Represents Vector's navigation memory map.
@@ -403,6 +429,7 @@ class NavMapComponent(util.Component):
         try:
             req = protocol.NavMapFeedRequest(frequency=frequency)
             async for evt in self.grpc_interface.NavMapFeed(req):
+                # print("latest nav map")
                 self._latest_nav_map = NavMapGrid(evt, self.logger)
                 await self._robot.events.dispatch_event(evt, Events.nav_map_update)
         except CancelledError:

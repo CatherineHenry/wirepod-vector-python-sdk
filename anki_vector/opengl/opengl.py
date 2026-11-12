@@ -66,6 +66,7 @@ def raise_opengl_or_pillow_import_error(opengl_import_exc):
 
 
 try:
+    #  TODO: copy these specific imports over to cozmo implementation too
     from OpenGL.GL import (GL_AMBIENT, GL_AMBIENT_AND_DIFFUSE, GL_CCW, GL_COLOR_BUFFER_BIT, GL_COMPILE, GL_DEPTH_BUFFER_BIT, GL_DEPTH_TEST, GL_DIFFUSE,
                            GL_FRONT, GL_LIGHT0, GL_LINEAR, GL_MODELVIEW, GL_POLYGON, GL_PROJECTION, GL_POSITION, GL_RGBA, GL_SHININESS, GL_SMOOTH, GL_SPECULAR,
                            GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER, GL_UNSIGNED_BYTE,
@@ -74,13 +75,22 @@ try:
                            glNormal3fv, glScalef, glShadeModel, glTexCoord2fv, glTexImage2D, glTexParameteri,
                            glTexSubImage2D, glVertex3fv, glViewport)
     from OpenGL.GLU import gluLookAt, gluPerspective
-    from OpenGL.GLUT import (glutCreateWindow, glutDisplayFunc, glutIdleFunc, glutInit, glutInitDisplayMode,
-                             glutInitWindowPosition, glutInitWindowSize, glutPostRedisplay, glutReshapeFunc,
-                             glutSetWindow, glutSwapBuffers, glutVisibilityFunc,
+    from OpenGL.GLUT import (glutCreateWindow, glutInit,
+                             glutInitWindowPosition, glutInitWindowSize, glutReshapeFunc,
+                              glutSwapBuffers,
                              GLUT_DEPTH, GLUT_DOUBLE, GLUT_RGB, GLUT_VISIBLE)
     from OpenGL.error import NullFunctionError
 
+
+
     from PIL import Image
+    from PySide6.QtCore import Qt, QTimer
+    from PySide6.QtOpenGL import QOpenGLWindow
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtWidgets import (
+        QWidget,
+        QVBoxLayout,
+    )
 
 except ImportError as import_exc:
     raise_opengl_or_pillow_import_error(import_exc)
@@ -95,10 +105,10 @@ def _glut_install_instructions():
     if sys.platform.startswith('darwin'):
         return "GLUT should already be installed by default on macOS!"
     if sys.platform in ('win32', 'cygwin'):
-        return "Install freeglut: You can download it from http://freeglut.sourceforge.net/ \n"\
-            "You just need the `freeglut.dll` file, from any of the 'Windows binaries' downloads. "\
-            "Place the DLL next to your Python script, or install it somewhere in your PATH "\
-            "to allow any script to use it."
+        return "Install freeglut: You can download it from http://freeglut.sourceforge.net/ \n" \
+               "You just need the `freeglut.dll` file, from any of the 'Windows binaries' downloads. " \
+               "Place the DLL next to your Python script, or install it somewhere in your PATH " \
+               "to allow any script to use it."
     return "(Instructions unknown for platform %s)" % sys.platform
 
 
@@ -480,7 +490,10 @@ class MeshData():
 
 class PrecomputedView():
     """A collection of static 3D object which are pre-computed on the graphics card, so they can
-    be quickly drawn when needed."""
+    be quickly drawn when needed.
+
+    Similar to Cozmo OpenGL RenderableObject
+    """
 
     def __init__(self):
         self._display_lists = {}
@@ -594,7 +607,10 @@ class PrecomputedView():
 
 
 class Camera():
-    """Class containing the state of a 3d camera, used to transform all object in a scene with
+    """
+    *Not* Vector's camera -- this is the 3d viewer camera.
+
+    Class containing the state of a 3d camera, used to transform all object in a scene with
     relation to a particular point of view.
 
     This class is meant to be mutated at run time.
@@ -786,15 +802,13 @@ class OpenGLWindow():
         """The vertical height of the window:"""
         return self._height
 
-    def initialize(self, display_function: callable):
+
+    def init_display(self, display_function: callable):
         """Initialze the OpenGL display parts of the Window.
 
         Warning:
             Must be called on the same thread as OpenGL (usually the main thread),
         """
-
-        glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH)
-
         glutInitWindowSize(self.width, self.height)
         glutInitWindowPosition(*self._pos)
         self._gl_window = glutCreateWindow(self._window_name)
@@ -803,11 +817,8 @@ class OpenGLWindow():
         glEnable(GL_DEPTH_TEST)
         glShadeModel(GL_SMOOTH)
 
-        glutIdleFunc(self._idle)
-        glutVisibilityFunc(self._visible)
-        glutReshapeFunc(self._reshape)
 
-        glutDisplayFunc(display_function)
+        glutReshapeFunc(self._reshape)
 
     def prepare_for_rendering(self, projector: Projector, camera: Camera, lights: List[Light]):
         """Selects the window, clears buffers, and sets up the scene transform and lighting state.
@@ -816,7 +827,6 @@ class OpenGLWindow():
         :param camera: The camera object to use for this rendering pass.
         :param lights: The light list to use for this rendering pass.
         """
-        glutSetWindow(self._gl_window)
 
         # Clear the screen and the depth buffer
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
@@ -841,17 +851,6 @@ class OpenGLWindow():
         """
         glutSwapBuffers()
 
-    def _idle(self):  # pylint: disable=no-self-use
-        """Called from OpenGL when idle."""
-        glutPostRedisplay()
-
-    def _visible(self, vis):
-        """Called from OpenGL when visibility changes (windows are either visible
-        or completely invisible/hidden)."""
-        if vis == GLUT_VISIBLE:
-            glutIdleFunc(self._idle)
-        else:
-            glutIdleFunc(None)
 
     def _reshape(self, width: int, height: int):
         """Called from OpenGL whenever this window is resized.

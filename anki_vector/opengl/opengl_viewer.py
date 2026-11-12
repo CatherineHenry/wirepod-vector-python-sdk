@@ -51,7 +51,7 @@ Warning:
 """
 
 # __all__ should order by constants, event classes, other classes, functions.
-__all__ = ['OpenGLViewer']
+__all__ = ['SimpleGLWindow']
 
 import math
 import multiprocessing as mp
@@ -69,18 +69,19 @@ try:
                            GL_TEXTURE_2D,
                            glBindTexture, glColor3f, glDisable, glEnable,
                            glMultMatrixf, glPolygonMode, glPopMatrix, glPushMatrix,
-                           glScalef, glWindowPos2f)
+                           glScalef, glWindowPos2f, GL_DEPTH_TEST, GL_LESS, GL_SMOOTH, glClearColor, glDepthFunc, glShadeModel)
     from OpenGL.GLUT import (ctypes,
                              GLUT_ACTIVE_ALT, GLUT_ACTIVE_CTRL, GLUT_ACTIVE_SHIFT, GLUT_BITMAP_9_BY_15,
                              GLUT_DOWN, GLUT_LEFT_BUTTON, GLUT_RIGHT_BUTTON, GLUT_VISIBLE,
-                             glutBitmapCharacter, glutCheckLoop, glutGetModifiers, glutIdleFunc,
-                             glutKeyboardFunc, glutKeyboardUpFunc, glutMainLoop, glutMouseFunc, glutMotionFunc, glutPassiveMotionFunc,
-                             glutPostRedisplay, glutSpecialFunc, glutSpecialUpFunc, glutVisibilityFunc)
+                             glutBitmapCharacter,glutCreateWindow)
     from OpenGL.error import NullFunctionError
 
 except ImportError as import_exc:
     opengl.raise_opengl_or_pillow_import_error(import_exc)
 
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtOpenGL import QOpenGLWindow
+from PySide6.QtWidgets import QApplication
 
 # Constants
 
@@ -120,273 +121,11 @@ def _glut_install_instructions():
     if sys.platform.startswith('darwin'):
         return "GLUT should already be installed by default on macOS!"
     if sys.platform in ('win32', 'cygwin'):
-        return "Install freeglut: You can download it from http://freeglut.sourceforge.net/ \n"\
-            "You just need the `freeglut.dll` file, from any of the 'Windows binaries' downloads. "\
-            "Place the DLL next to your Python script, or install it somewhere in your PATH "\
-            "to allow any script to use it."
+        return "Install freeglut: You can download it from http://freeglut.sourceforge.net/ \n" \
+               "You just need the `freeglut.dll` file, from any of the 'Windows binaries' downloads. " \
+               "Place the DLL next to your Python script, or install it somewhere in your PATH " \
+               "to allow any script to use it."
     return "(Instructions unknown for platform %s)" % sys.platform
-
-
-class _OpenGLViewController():
-    """Controller that registers for keyboard and mouse input through GLUT, and uses them to update
-    the camera and listen for a shutdown cue.
-
-    :param shutdown_delegate: Function to call when we want to exit the host OpenGLViewer.
-    :param camera: The camera object for the controller to mutate.
-    :param input_intent_queue: Sends key commands from the 3D viewer process to the main process.
-    :type input_intent_queue: multiprocessing.Queue
-    :param viewer: A reference to the owning OpenGLViewer.
-    :type viewer: OpenGLViewer
-    """
-
-    def __init__(self, shutdown_delegate: callable, camera: opengl.Camera, input_intent_queue: mp.Queue, viewer):
-
-        self._logger = util.get_class_logger(__name__, self)
-        self._input_intent_queue = input_intent_queue
-        self._last_robot_control_intents = _RobotControlIntents()
-        self._is_keyboard_control_enabled = False
-
-        # Keyboard
-        self._is_key_pressed = {}
-        self._is_alt_down = False
-        self._is_ctrl_down = False
-        self._is_shift_down = False
-
-        # Mouse
-        self._is_mouse_down = {}
-        self._mouse_pos = None  # type: util.Vector2
-
-        self._shutdown_delegate = shutdown_delegate
-
-        self._last_robot_position = None
-
-        self._camera = camera
-
-        self._opengl_viewer = viewer
-
-    #### Public Properties ####
-
-    @property
-    def last_robot_position(self):
-        return self._last_robot_position
-
-    @last_robot_position.setter
-    def last_robot_position(self, last_robot_position):
-        self._last_robot_position = last_robot_position
-
-    #### Public Methods ####
-
-    def initialize(self):
-        """Sets up the OpenGL window and binds input callbacks to it
-        """
-
-        glutKeyboardFunc(self._on_key_down)
-        glutSpecialFunc(self._on_special_key_down)
-
-        # [Keyboard/Special]Up methods aren't supported on some old GLUT implementations
-        has_keyboard_up = False
-        has_special_up = False
-        try:
-            if bool(glutKeyboardUpFunc):
-                glutKeyboardUpFunc(self._on_key_up)
-                has_keyboard_up = True
-            if bool(glutSpecialUpFunc):
-                glutSpecialUpFunc(self._on_special_key_up)
-                has_special_up = True
-        except NullFunctionError:
-            # Methods aren't available on this GLUT version
-            pass
-
-        if not has_keyboard_up or not has_special_up:
-            # Warn on old GLUT implementations that don't implement much of the interface.
-            self._logger.warning("Warning: Old GLUT implementation detected - keyboard remote control of Vector disabled."
-                                 "We recommend installing freeglut. %s", _glut_install_instructions())
-            self._is_keyboard_control_enabled = False
-        else:
-            self._is_keyboard_control_enabled = True
-
-        try:
-            GLUT_BITMAP_9_BY_15
-        except NameError:
-            self._logger.warning("Warning: GLUT font not detected. Help message will be unavailable.")
-
-        glutMouseFunc(self._on_mouse_button)
-        glutMotionFunc(self._on_mouse_move)
-        glutPassiveMotionFunc(self._on_mouse_move)
-
-        glutIdleFunc(self._idle)
-        glutVisibilityFunc(self._visible)
-
-    #### Private Methods ####
-
-    def _update_modifier_keys(self):
-        """Updates alt, ctrl, and shift states.
-        """
-        modifiers = glutGetModifiers()
-        self._is_alt_down = (modifiers & GLUT_ACTIVE_ALT != 0)
-        self._is_ctrl_down = (modifiers & GLUT_ACTIVE_CTRL != 0)
-        self._is_shift_down = (modifiers & GLUT_ACTIVE_SHIFT != 0)
-
-    def _key_byte_to_lower(self, key):  # pylint: disable=no-self-use
-        """Convert bytes-object (representing keyboard character) to lowercase equivalent.
-        """
-        if b'A' <= key <= b'Z':
-            lowercase_key = ord(key) - ord(b'A') + ord(b'a')
-            lowercase_key = bytes([lowercase_key])
-            return lowercase_key
-        return key
-
-    def _on_key_up(self, key, x, y):  # pylint: disable=unused-argument
-        """Called by GLUT when a standard keyboard key is released.
-
-        :param key: which key was released.
-        :param x: the x coordinate of the mouse cursor.
-        :param y: the y coordinate of the mouse cursor.
-        """
-        key = self._key_byte_to_lower(key)
-        self._update_modifier_keys()
-        self._is_key_pressed[key] = False
-
-    def _on_key_down(self, key, x, y):  # pylint: disable=unused-argument
-        """Called by GLUT when a standard keyboard key is pressed.
-
-        :param key: which key was released.
-        :param x: the x coordinate of the mouse cursor.
-        :param y: the y coordinate of the mouse cursor.
-        """
-        key = self._key_byte_to_lower(key)
-        self._update_modifier_keys()
-        self._is_key_pressed[key] = True
-
-        if ord(key) == 9:  # Tab
-            # Set Look-At point to current robot position
-            if self._last_robot_position is not None:
-                self._camera.look_at = self._last_robot_position
-        elif ord(key) == 27:  # Escape key
-            self._shutdown_delegate()
-        elif ord(key) == 72 or ord(key) == 104:  # H key
-            self._opengl_viewer.show_controls = not self._opengl_viewer.show_controls
-
-    def _on_special_key_up(self, key, x, y):  # pylint: disable=unused-argument
-        """Called by GLUT when a special key is released.
-
-        :param key: which key was released.
-        :param x: the x coordinate of the mouse cursor.
-        :param y: the y coordinate of the mouse cursor.
-        """
-        self._update_modifier_keys()
-
-    def _on_special_key_down(self, key, x, y):  # pylint: disable=unused-argument
-        """Called by GLUT when a special key is pressed.
-
-        :param key: which key was pressed.
-        :param x: the x coordinate of the mouse cursor.
-        :param y: the y coordinate of the mouse cursor.
-        """
-        self._update_modifier_keys()
-
-    def _on_mouse_button(self, button, state, x, y):
-        """Called by GLUT when a mouse button is pressed.
-
-        :param button: which button was pressed.
-        :param state: the current state of the button.
-        :param x: the x coordinate of the mouse cursor.
-        :param y: the y coordinate of the mouse cursor.
-        """
-        # Don't update modifier keys- reading modifier keys is unreliable
-        # from _on_mouse_button (for LMB down/up), only SHIFT key seems to read there
-        # self._update_modifier_keys()
-        is_down = (state == GLUT_DOWN)
-        self._is_mouse_down[button] = is_down
-        self._mouse_pos = util.Vector2(x, y)
-
-    def _on_mouse_move(self, x, y):
-        """Handles mouse movement.
-
-        :param x: the x coordinate of the mouse cursor.
-        :param y: the y coordinate of the mouse cursor.
-        """
-
-        # is_active is True if this is not passive (i.e. a mouse button was down)
-        last_mouse_pos = self._mouse_pos
-        self._mouse_pos = util.Vector2(x, y)
-        if last_mouse_pos is None:
-            # First mouse update - ignore (we need a delta of mouse positions)
-            return
-
-        left_button = self._is_mouse_down.get(GLUT_LEFT_BUTTON, False)
-        # For laptop and other 1-button mouse users, treat 'x' key as a right mouse button too
-        right_button = (self._is_mouse_down.get(GLUT_RIGHT_BUTTON, False)
-                        or self._is_key_pressed.get(b'x', False))
-
-        MOUSE_SPEED_SCALAR = 1.0  # general scalar for all mouse movement sensitivity
-        MOUSE_ROTATE_SCALAR = 0.025  # additional scalar for rotation sensitivity
-        mouse_delta = (self._mouse_pos - last_mouse_pos) * MOUSE_SPEED_SCALAR
-
-        if left_button and right_button:
-            # Move up/down
-            self._camera.move(up_amount=-mouse_delta.y)
-        elif right_button:
-            # Move forward/back and left/right
-            self._camera.move(forward_amount=mouse_delta.y, right_amount=mouse_delta.x)
-        elif left_button:
-            if self._is_key_pressed.get(b'z', False):
-                # Zoom in/out
-                self._camera.zoom(mouse_delta.y)
-            else:
-                self._camera.turn(mouse_delta.x * MOUSE_ROTATE_SCALAR, mouse_delta.y * MOUSE_ROTATE_SCALAR)
-
-    def _update_intents_for_robot(self):
-        # Update driving intents based on current input, and pass to SDK thread
-        # so that it can pass the input onto the robot.
-        def get_intent_direction(key1, key2):
-            # Helper for keyboard inputs that have 1 positive and 1 negative input
-            pos_key = self._is_key_pressed.get(key1, False)
-            neg_key = self._is_key_pressed.get(key2, False)
-            return pos_key - neg_key
-
-        drive_dir = get_intent_direction(b'w', b's')
-        turn_dir = get_intent_direction(b'd', b'a')
-        lift_dir = get_intent_direction(b'r', b'f')
-        head_dir = get_intent_direction(b't', b'g')
-        if drive_dir < 0:
-            # It feels more natural to turn the opposite way when reversing
-            turn_dir = -turn_dir
-
-        # Scale drive speeds with SHIFT (faster) and ALT (slower)
-        if self._is_shift_down:
-            speed_scalar = 2.0
-        elif self._is_alt_down:
-            speed_scalar = 0.5
-        else:
-            speed_scalar = 1.0
-
-        drive_speed = 75.0 * speed_scalar
-        turn_speed = 100.0 * speed_scalar
-
-        left_wheel_speed = (drive_dir * drive_speed) + (turn_speed * turn_dir)
-        right_wheel_speed = (drive_dir * drive_speed) - (turn_speed * turn_dir)
-        lift_speed = 4.0 * lift_dir * speed_scalar
-        head_speed = head_dir * speed_scalar
-
-        connect_block = self._is_key_pressed.get(b'c', False)
-
-        control_intents = _RobotControlIntents(left_wheel_speed, right_wheel_speed,
-                                               lift_speed, head_speed, connect_block)
-        self._input_intent_queue.put(control_intents, True)
-
-    def _idle(self):
-        if self._is_keyboard_control_enabled:
-            self._update_intents_for_robot()
-        glutPostRedisplay()
-
-    def _visible(self, vis):
-        # Called from OpenGL when visibility changes (windows are either visible
-        # or completely invisible/hidden)
-        if vis == GLUT_VISIBLE:
-            glutIdleFunc(self._idle)
-        else:
-            glutIdleFunc(None)
 
 
 #: A default window resolution provided for OpenGL Vector programs
@@ -425,7 +164,7 @@ default_lights = [opengl.Light(
 opengl_viewer = None  # type: OpenGLViewer
 
 
-class OpenGLViewer():
+class SimpleGLWindow(QOpenGLWindow):
     """OpenGL-based 3D Viewer.
 
     Handles rendering of a 3D world view including navigation map.
@@ -462,6 +201,8 @@ class OpenGLViewer():
                  camera: opengl.Camera = None,
                  lights: List[opengl.Light] = None,
                  show_viewer_controls: bool = True):
+        super().__init__()
+        self.setFlags(Qt.WindowStaysOnTopHint)
         if resolution is None:
             resolution = default_resolution
         if projector is None:
@@ -508,10 +249,154 @@ class OpenGLViewer():
         self._projector = projector
         self._camera = camera
         self._lights = lights
+        self._logger = util.get_class_logger(__name__, self)
+        self._input_intent_queue = input_intent_queue
+        self._last_robot_control_intents = _RobotControlIntents()
+        self._is_keyboard_control_enabled = True
 
-        self._view_controller = _OpenGLViewController(self.close, self._camera, self._input_intent_queue, self)
+        # Keyboard
+        self._is_key_pressed = {}
+        self._is_alt_down = False
+        self._is_ctrl_down = False
+        self._is_shift_down = False
 
+        # Mouse
+        self._is_mouse_down = {}
+        self._mouse_pos = None  # type: util.Vector2
+
+        self._shutdown_delegate = self.close
+
+        self._last_robot_position = None
+
+        self._camera = camera
+
+
+    def initializeGL(self):
+        "called when the OpenGL context is valid, just before first call to paint"
+        glClearColor(0, 0, 0, 0)
+        glEnable(GL_DEPTH_TEST)
+        glDepthFunc(GL_LESS)
+        glShadeModel(GL_SMOOTH)
+
+        self._vector_view_manifest.load_assets()
         self._latest_world_frame: opengl_vector.WorldRenderFrame = None
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update) # Triggers paintGL
+        self.timer.start(8) # ~80 FPS (1000ms / 80)
+
+        self.keyboard_control_timer = QTimer(self)
+        self.keyboard_control_timer.timeout.connect(self._idle)
+        self.keyboard_control_timer.start(6)
+
+
+    def keyReleaseEvent(self, event):
+        """Called by GLUT when a standard keyboard key is released.
+
+        :param key: which key was released.
+        :param x: the x coordinate of the mouse cursor.
+        :param y: the y coordinate of the mouse cursor.
+        """
+        key = event.text()
+        self._is_key_pressed[key] = False
+
+    def keyPressEvent(self, event):  # pylint: disable=unused-argument
+        """Called by GLUT when a standard keyboard key is pressed.
+
+        :param key: which key was released.
+        :param x: the x coordinate of the mouse cursor.
+        :param y: the y coordinate of the mouse cursor.
+        """
+        key = event.text()
+        self._is_key_pressed[key] = True
+
+        if event.key() == Qt.Key.Key_Tab:  # Tab
+            # Set Look-At point to current robot position
+            if self._last_robot_position is not None:
+                self._camera.look_at = self._last_robot_position
+        if event.key() == Qt.Key.Key_Escape:  # Escape key
+            QApplication.quit()
+        elif key == 'h' or key == 'H':  # H key
+            self.show_controls = not self.show_controls
+
+    def mousePressEvent(self, event):
+        self._mouse_pos = util.Vector2(event.position().x(), event.position().y())
+
+    def mouseMoveEvent(self, event):
+        """Handles mouse movement.
+
+        :param x: the x coordinate of the mouse cursor.
+        :param y: the y coordinate of the mouse cursor.
+        """
+
+        # is_active is True if this is not passive (i.e. a mouse button was down)
+        last_mouse_pos = self._mouse_pos
+        self._mouse_pos = util.Vector2(event.position().x(), event.position().y())
+        if last_mouse_pos is None:
+            # First mouse update - ignore (we need a delta of mouse positions)
+            return
+
+        MOUSE_SPEED_SCALAR = 1.0  # general scalar for all mouse movement sensitivity
+        MOUSE_ROTATE_SCALAR = 0.025  # additional scalar for rotation sensitivity
+        mouse_delta = (self._mouse_pos - last_mouse_pos) * MOUSE_SPEED_SCALAR
+
+        if  event.buttons() == Qt.MouseButton.RightButton and event.buttons() == Qt.MouseButton.LeftButton:
+            # Move up/down
+            self._camera.move(up_amount=-mouse_delta.y)
+        elif event.buttons() == Qt.MouseButton.RightButton:
+            # Move forward/back and left/right
+            self._camera.move(forward_amount=mouse_delta.y, right_amount=mouse_delta.x)
+        if event.buttons() == Qt.MouseButton.LeftButton:
+            if self._is_key_pressed.get('z', False):
+                # Zoom in/out
+                self._camera.zoom(mouse_delta.y)
+            else:
+                self._camera.turn(mouse_delta.x * MOUSE_ROTATE_SCALAR, mouse_delta.y * MOUSE_ROTATE_SCALAR)
+
+    def _update_intents_for_robot(self):
+        # Update driving intents based on current input, and pass to SDK thread
+        # so that it can pass the input onto the robot.
+        def get_intent_direction(key1, key2):
+            # Helper for keyboard inputs that have 1 positive and 1 negative input
+            pos_key = self._is_key_pressed.get(key1, False)
+            neg_key = self._is_key_pressed.get(key2, False)
+            return pos_key - neg_key
+
+        drive_dir = get_intent_direction('w', 's')
+        turn_dir = get_intent_direction('d', 'a')
+        lift_dir = get_intent_direction('r', 'f')
+        head_dir = get_intent_direction('t', 'g')
+        if drive_dir < 0:
+            # It feels more natural to turn the opposite way when reversing
+            turn_dir = -turn_dir
+
+        # # Scale drive speeds with SHIFT (faster) and ALT (slower)
+        # if self._is_shift_down:
+        #     speed_scalar = 2.0
+        # elif self._is_alt_down:
+        #     speed_scalar = 0.5
+        # else:
+        #     speed_scalar = 1.0
+        speed_scalar = 1.0
+
+        drive_speed = 75.0 * speed_scalar
+        turn_speed = 100.0 * speed_scalar
+
+        left_wheel_speed = (drive_dir * drive_speed) + (turn_speed * turn_dir)
+        right_wheel_speed = (drive_dir * drive_speed) - (turn_speed * turn_dir)
+        lift_speed = 4.0 * lift_dir * speed_scalar
+        head_speed = head_dir * speed_scalar
+
+        connect_block = self._is_key_pressed.get('c', False)
+
+        control_intents = _RobotControlIntents(left_wheel_speed, right_wheel_speed,
+                                               lift_speed, head_speed, connect_block)
+        self._input_intent_queue.put(control_intents, True)
+
+    def _idle(self):
+        if self._is_keyboard_control_enabled:
+            self._update_intents_for_robot()
+
 
     def _render_world_frame(self, world_frame: opengl_vector.WorldRenderFrame):
         """Render the world to the current OpenGL context
@@ -624,7 +509,7 @@ class OpenGLViewer():
         try:
             world_frame = self._world_frame_queue.get(False)  # type: WorldRenderFrame
             if world_frame is not None:
-                self._view_controller.last_robot_position = world_frame.robot_frame.pose.position
+                self._last_robot_position = world_frame.robot_frame.pose.position
             self._latest_world_frame = world_frame
         except mp.queues.Empty:
             world_frame = self._latest_world_frame
@@ -652,7 +537,7 @@ class OpenGLViewer():
 
         window.display_rendered_content()
 
-    def _on_window_update(self):
+    def paintGL(self):
         """Top level display call.
         """
         try:
@@ -662,28 +547,8 @@ class OpenGLViewer():
             self._logger.info("_display caught KeyboardInterrupt - exitting")
             self._close_event.set()
 
-    def run(self):
-        """Turns control of the current thread over to the OpenGL viewer
-        """
-        self._main_window.initialize(self._on_window_update)
-        self._view_controller.initialize()
 
-        self._vector_view_manifest.load_assets()
-
-        # use a non-blocking update loop if possible to make exit conditions
-        # easier (not supported on all GLUT versions).
-        if bool(glutCheckLoop):
-            while not self._close_event.is_set():
-                glutCheckLoop()
-        else:
-            # This blocks until quit
-            glutMainLoop()
-
-        if not self._close_event.is_set():
-            # Pass the keyboard interrupt on to SDK so that it can close cleanly
-            raise KeyboardInterrupt
-
-    def close(self):
+    def disconnect(self):
         """Called from the SDK when the program is complete and it's time to exit."""
         if not self._close_event.is_set():
             self._close_event.set()

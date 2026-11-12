@@ -40,8 +40,13 @@ Warning:
 """
 
 import multiprocessing as mp
+import sys
+import time
 
-from . import opengl_viewer
+from PySide6.QtGui import QSurfaceFormat
+from PySide6.QtWidgets import QApplication
+
+from anki_vector.opengl import opengl_viewer
 
 
 def main(close_event: mp.Event,
@@ -90,14 +95,28 @@ def main(close_event: mp.Event,
         May be used by ``extra_render_function_queue`` functions.
     :param show_viewer_controls: Specifies whether to draw controls on the view.
     """
-    viewer = opengl_viewer.OpenGLViewer(close_event,
+    # Before QApplication creation
+    format = QSurfaceFormat()
+    format.setDepthBufferSize(24)  # Request 24-bit depth
+    format.setStencilBufferSize(8) # Recommended to include stencil
+    QSurfaceFormat.setDefaultFormat(format)
+
+    app = QApplication(sys.argv)
+
+    window = opengl_viewer.SimpleGLWindow(
+                                        close_event,
                                         input_intent_queue,
                                         nav_map_queue,
                                         world_frame_queue,
                                         extra_render_function_queue,
                                         user_data_queue,
                                         show_viewer_controls=show_viewer_controls)
-    viewer.run()
+
+    window.resize(800, 600)
+    window.setPosition(0,0)
+    window.show()
+    sys.exit(app.exec())
+
 
 
 __all__ = ['main']
